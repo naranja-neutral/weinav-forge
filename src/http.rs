@@ -17,7 +17,24 @@ const HUAWEI_CIPHERS: &str = concat!(
     "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:",
     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"
 );
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+// Whole-request time must scale with the payload. Source bodies routinely run
+// into the tens of MB on hosts well below 150 KB/s (2026-11-06: a 9.85 MB CODE
+// day-file at 95 KB/s; a 61.6 MB igs20.atx at 28 KB/s — reachable hosts, just
+// slow), so a flat cap aborts large bodies no matter how it is tuned. Headers
+// stay on a short cap; a body gets 30 s plus its Content-Length at a 25 KB/s
+// floor (600 s when the length is unknown). connect_timeout still bounds dead
+// hosts, and fetch.rs retries each URL twice before its chain falls through.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(60);
+const MIN_BODY_RATE: u64 = 25_000;
+const BODY_MARGIN: Duration = Duration::from_secs(30);
+const DEFAULT_BODY_TIMEOUT: Duration = Duration::from_secs(600);
+
+fn body_budget(content_length: Option<u64>) -> Duration {
+    match content_length {
+        Some(len) => BODY_MARGIN + Duration::from_secs(len / MIN_BODY_RATE),
+        None => DEFAULT_BODY_TIMEOUT,
+    }
+}
 const MAX_REDIRECTS: usize = 5;
 
 #[cfg(test)]
@@ -119,7 +136,6 @@ fn huawei_emulation() -> Emulation {
 fn builder() -> ClientBuilder {
     wreq::Client::builder()
         .connect_timeout(Duration::from_secs(8))
-        .timeout(REQUEST_TIMEOUT)
         .redirect(wreq::redirect::Policy::none())
         .referer(false)
 }
@@ -154,6 +170,15 @@ pub struct Response {
     pub last_modified: Option<String>,
 }
 
+struct Head {
+    not_modified: bool,
+    response: wreq::Response,
+    encoding: String,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    content_length: Option<u64>,
+}
+
 impl Client {
     pub fn new() -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -171,11 +196,7 @@ impl Client {
     }
 
     pub fn get(&self, url: &Url, etag: Option<&str>, modified: Option<&str>) -> Result<Response> {
-        self.runtime.block_on(async {
-            tokio::time::timeout(REQUEST_TIMEOUT, self.download(url, etag, modified))
-                .await
-                .context("HTTP download timed out")?
-        })
+        self.runtime.block_on(self.download(url, etag, modified))
     }
 
     async fn download(
@@ -184,6 +205,51 @@ impl Client {
         etag: Option<&str>,
         modified: Option<&str>,
     ) -> Result<Response> {
+        let head = tokio::time::timeout(HEADER_TIMEOUT, self.resolve(url, etag, modified))
+            .await
+            .context("HTTP headers timed out")??;
+        let mut bytes = Vec::new();
+        if !head.not_modified {
+            let collect = async {
+                let mut stream = head.response.bytes_stream();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk?;
+                    ensure!(
+                        bytes.len() as u64 + chunk.len() as u64 <= MAX_DECODED_BYTES,
+                        "download exceeds size limit"
+                    );
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok::<_, anyhow::Error>(bytes)
+            };
+            bytes = tokio::time::timeout(body_budget(head.content_length), collect)
+                .await
+                .context("HTTP body timed out")??;
+            if head.encoding.eq_ignore_ascii_case("gzip") {
+                ensure!(bytes.starts_with(&[0x1f, 0x8b]), "invalid HTTP gzip body");
+                bytes = decompress(&bytes)?.into_owned();
+            } else {
+                ensure!(
+                    head.encoding.eq_ignore_ascii_case("identity"),
+                    "unsupported HTTP content encoding {}",
+                    head.encoding
+                );
+            }
+        }
+        Ok(Response {
+            not_modified: head.not_modified,
+            bytes,
+            etag: head.etag,
+            last_modified: head.last_modified,
+        })
+    }
+
+    async fn resolve(
+        &self,
+        url: &Url,
+        etag: Option<&str>,
+        modified: Option<&str>,
+    ) -> Result<Head> {
         let mut destination = url.clone();
         for redirect in 0..=MAX_REDIRECTS {
             ensure!(
@@ -238,38 +304,18 @@ impl Client {
             let etag = header("etag");
             let last_modified = header("last-modified");
             let encoding = header("content-encoding").unwrap_or_else(|| "identity".into());
+            let content_length = response.content_length();
             ensure!(
-                response
-                    .content_length()
-                    .is_none_or(|n| n <= MAX_DECODED_BYTES),
+                content_length.is_none_or(|n| n <= MAX_DECODED_BYTES),
                 "download exceeds size limit"
             );
-            let mut bytes = Vec::new();
-            if !not_modified {
-                let mut stream = response.bytes_stream();
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk?;
-                    ensure!(
-                        bytes.len() as u64 + chunk.len() as u64 <= MAX_DECODED_BYTES,
-                        "download exceeds size limit"
-                    );
-                    bytes.extend_from_slice(&chunk);
-                }
-                if encoding.eq_ignore_ascii_case("gzip") {
-                    ensure!(bytes.starts_with(&[0x1f, 0x8b]), "invalid HTTP gzip body");
-                    bytes = decompress(&bytes)?.into_owned();
-                } else {
-                    ensure!(
-                        encoding.eq_ignore_ascii_case("identity"),
-                        "unsupported HTTP content encoding {encoding}"
-                    );
-                }
-            }
-            return Ok(Response {
+            return Ok(Head {
                 not_modified,
-                bytes,
+                response,
+                encoding,
                 etag,
                 last_modified,
+                content_length,
             });
         }
         bail!("too many HTTP redirects")
